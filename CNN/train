@@ -1,0 +1,168 @@
+#!/usr/bin/env python
+
+from __future__ import print_function
+
+import json
+import os
+import sys
+import traceback
+from tensorflow.keras import layers, models
+import pandas as pd
+import numpy as np
+from PIL import Image
+from tensorflow.keras.utils import Sequence
+import pandas as pd
+from tensorflow.keras.callbacks import ModelCheckpoint
+from sklearn.model_selection import train_test_split
+
+
+# Important path for sagemaker
+prefix = '/opt/ml/'
+
+input_path = prefix + 'input/data'
+output_path = os.path.join(prefix, 'output')
+model_path = os.path.join(prefix, 'model')
+param_path = os.path.join(prefix, 'input/config/hyperparameters.json')
+
+channel_name = 'training'
+training_path = os.path.join(input_path, channel_name)
+
+def load_data():
+    data_path = os.path.join(input_path, 'dataset2.csv')
+    df = pd.read_csv(data_path)
+    train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
+    return train_df, test_df
+
+
+class ImageDataGenerator(Sequence):
+    def __init__(self, dataset, batch_size=32, target_size=(255, 255), shuffle=True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.target_size = target_size
+        self.shuffle = shuffle
+        self.indexes = np.arange(len(dataset))
+
+    def __len__(self):
+        return int(np.ceil(len(self.dataset) / self.batch_size))
+
+    def __getitem__(self, index):
+        batch_indexes = self.indexes[index * self.batch_size:(index + 1) * self.batch_size]
+        batch_data = self.dataset.iloc[batch_indexes]
+
+        X = []
+        y = []
+
+        for _, row in batch_data.iterrows():
+            image_arrays = []
+            for pollutant in ["SO2", "CO", "AER_AI", "O3", "NO2"]:
+                s3_key = row[pollutant]
+                path = os.path.join(training_path, s3_key)
+                try:
+                    img = Image.open(path)
+                    img = img.resize(self.target_size)
+                    img_array = np.array(img) / 255.0
+                    image_arrays.append(img_array)
+                except Exception as e:
+                    print(f"Error reading image {path}: {e}")
+                    break
+
+            if len(image_arrays) == 5:
+                X.append(np.stack(image_arrays, axis=-1))
+                y.append(row['pm25'])
+
+        X = np.array(X)
+        y = np.array(y)
+
+        print("Shape of X (input):", X.shape)
+        print("Shape of y (target):", y.shape)
+
+        X = np.split(X, 5, axis=-1)
+        for i in range(5):
+            X[i] = np.squeeze(X[i], axis=-1)
+            print(X[i].shape)
+
+
+        return tuple(X), y
+
+    def on_epoch_end(self):
+        if self.shuffle:
+            np.random.shuffle(self.indexes)
+
+def train():
+    print('[INFO] Starting the training.....')
+    try: 
+        # Read in any hyperparameters that the user passed with the training job
+        with open(param_path, 'r') as tc:
+            trainingParams = json.load(tc)
+        
+        print("[INFO] Hyperparameters: ", trainingParams)
+
+        input_shape = (255, 255, 3)
+
+        input_layers = []
+
+        for _ in range(5):
+            input_layer = layers.Input(shape=input_shape)
+            input_layers.append(input_layer)
+
+        outputs = []
+
+        for i in range(5):
+            # create a branch for each input
+            x = layers.Conv2D(32, (4, 4), activation='relu')(input_layers[i])
+            x = layers.MaxPooling2D((2, 2))(x)
+            x = layers.Conv2D(16, (4, 4), activation='relu')(x)
+            x = layers.MaxPooling2D((2, 2))(x)
+            x = layers.Dropout(0.5)(x)
+            x = layers.Flatten()(x)
+            outputs.append(x)
+
+        merged = layers.Concatenate()(outputs)
+
+        #x = layers.Dense(64, activation='relu')(merged)
+        x = layers.Dense(32, activation='relu')(merged)
+        x = layers.Dense(10, activation='relu')(x)
+        output = layers.Dense(1, activation='relu')(x)
+
+        model = models.Model(inputs=input_layers, outputs=output)
+
+        model.compile(optimizer='adam', loss='mse', metrics=['mape', 'mae'])
+
+        train_df, test_df = load_data()
+        train_gen = ImageDataGenerator(train_df, batch_size=trainingParams.get('batch_size', 32))
+        val_gen = ImageDataGenerator(test_df, batch_size=trainingParams.get('batch_size', 32))
+
+        # Define a ModelCheckpoint callback to save weights
+        checkpoint_path = os.path.join(model_path, 'models.weight.h5')
+        checkpoint_callback = ModelCheckpoint(filepath=checkpoint_path,
+                                            save_weights_only=True,
+                                            monitor='val_loss',
+                                            save_best_only=True,
+                                            verbose=1)
+
+        # Train your model with the checkpoint callback
+        history = model.fit(train_gen,
+                            epochs=trainingParams.get('epochs', 10),
+                            validation_data=val_gen,
+                            callbacks=[checkpoint_callback])
+
+        # Save the entire model (architecture + weights) after training
+        model_save_path = os.path.join(model_path, 'trained_model.h5')
+        model.save(model_save_path)
+
+        print('[INFO] Training complete.')
+        print(f'[INFO] Model saved at: {model_path}.')
+    
+    except Exception as e:
+        trc = traceback.format_exc()
+        with open(os.path.join(output_path, 'failure'), 'w') as s:
+            s.write('[INFO] Exception during training: ' + str(e) + '\n' + trc)
+        # Printing this causes the exception to be in the training job logs, as well.
+        print('[INFO] Exception during training: ' + str(e) + '\n' + trc, file=sys.stderr)
+        # A non-zero exit code causes the training job to be marked as Failed.
+        sys.exit(255)
+
+
+if __name__ == '__main__':
+    train()
+    sys.exit(0)
