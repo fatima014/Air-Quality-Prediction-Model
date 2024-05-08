@@ -7,4 +7,4 @@ pillow
 requests
 scikit-learn
 scipy
-tensorflow==1.14.0
+tensorflow
