@@ -30,7 +30,7 @@ To deploy the trained model for inference:
 Clone the repository to your local machine:
 
 ```bash
-git clone https://github.com/your_username/air-quality-prediction.git
+git clone https://github.com/fatima014/Air-Quality-Prediction-Model.git
 cd air-quality-prediction
 ```
 
